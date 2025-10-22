@@ -1,0 +1,278 @@
+version: '3.8'
+
+# Single network for all services
+networks:
+  bigdata_net:
+    name: bigdata_net
+
+services:
+
+  # Workspace service used by Codespaces to open the repo.
+  workspace:
+    image: mcr.microsoft.com/vscode/devcontainers/base:ubuntu
+    container_name: codespace-workspace
+    tty: true
+    volumes:
+      - .:/workspace:cached
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - bigdata_net
+    # lightweight command: wait for other containers; Codespaces will use this container
+    healthcheck:
+      test: ["CMD-SHELL", "echo 'workspace up'"]
+      interval: 1m
+      retries: 3
+
+  # Postgres: Hive metastore DB (persistent)
+  postgres:
+    image: postgres:14
+    container_name: postgres-hive
+    environment:
+      POSTGRES_DB: hive
+      POSTGRES_USER: hive
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - bigdata_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hive"]
+      interval: 10s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # Zookeeper for Kafka
+  zookeeper:
+    image: wurstmeister/zookeeper:3.4.6
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    networks:
+      - bigdata_net
+    environment:
+      ZOO_MY_ID: 1
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc localhost 2181 | grep imok || exit 1"]
+      interval: 10s
+      retries: 10
+
+  # Kafka broker (single-node dev)
+  kafka:
+    image: wurstmeister/kafka:2.13-2.8.0
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_started
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_HOST_NAME: kafka
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_MESSAGE_MAX_BYTES: 2000000
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafkalogs:/kafka-logs
+    networks:
+      - bigdata_net
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server kafka:9092 || exit 1"]
+      interval: 15s
+      retries: 12
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  # Kafdrop UI for Kafka
+  kafdrop:
+    image: obsidiandynamics/kafdrop:3.27.0
+    container_name: kafdrop
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_BROKERCONNECT: kafka:9092
+      JVM_OPTS: "-Xms128M -Xmx512M"
+    ports:
+      - "9000:9000"
+    networks:
+      - bigdata_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/ || exit 1"]
+      interval: 15s
+      retries: 8
+
+  # HDFS NameNode (single-node dev)
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: namenode
+    environment:
+      - CLUSTER_NAME=bigdata
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
+      - HDFS_CONF_dfs_replication=1
+    ports:
+      - "9870:9870" # NameNode web UI
+    volumes:
+      - hdfs_namenode:/hadoop/dfs/name
+    networks:
+      - bigdata_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9870/ || exit 1"]
+      interval: 15s
+      retries: 12
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  # HDFS DataNode
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: datanode
+    depends_on:
+      - namenode
+    environment:
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
+      - HDFS_CONF_dfs_replication=1
+    volumes:
+      - hdfs_datanode:/hadoop/dfs/data
+    networks:
+      - bigdata_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://namenode:9870/ || exit 1"]
+      interval: 20s
+      retries: 12
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  # YARN ResourceManager
+  resourcemanager:
+    image: bde2020/hadoop-resourcemanager:2.0.0-hadoop3.2.1-java8
+    container_name: resourcemanager
+    depends_on:
+      - namenode
+    environment:
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
+    ports:
+      - "8088:8088" # YARN ResourceManager UI
+    networks:
+      - bigdata_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8088/ || exit 1"]
+      interval: 15s
+      retries: 12
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # Spark Master built for Hadoop3 (dev)
+  spark-master:
+    image: bde2020/spark-master:2.4.5-hadoop3.2
+    container_name: spark-master
+    depends_on:
+      - resourcemanager
+      - namenode
+    environment:
+      - SPARK_MASTER_WEBUI_PORT=8080
+      - SPARK_MASTER_HOST=spark-master
+      - HADOOP_CONF_DIR=/etc/hadoop
+    ports:
+      - "8080:8080"
+    networks:
+      - bigdata_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/ || exit 1"]
+      interval: 15s
+      retries: 12
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # Spark Worker
+  spark-worker:
+    image: bde2020/spark-worker:2.4.5-hadoop3.2
+    container_name: spark-worker
+    depends_on:
+      - spark-master
+      - resourcemanager
+    environment:
+      - SPARK_MASTER=spark://spark-master:7077
+      - SPARK_WORKER_WEBUI_PORT=8081
+    ports:
+      - "8081:8081"
+    networks:
+      - bigdata_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8081/ || exit 1"]
+      interval: 15s
+      retries: 12
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # Hive Metastore and HiveServer2 (using bde/hive image)
+  hive:
+    image: bde2020/hive:2.3.2-postgres-metastore
+    container_name: hive
+    depends_on:
+      - postgres
+      - namenode
+    environment:
+      - HIVE_METASTORE_URI=thrift://hive-metastore:9083
+      - HADOOP_HOME=/opt/hadoop
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=hive
+      - POSTGRES_USER=hive
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - HIVE_SITE_CONF_dfs_defaultFS=hdfs://namenode:9000
+      - HIVE_SITE_conf_metastore_connect_url_jdbc=jdbc:postgresql://postgres:5432/hive
+    ports:
+      - "9083:9083"   # Hive metastore Thrift
+      - "10000:10000" # HiveServer2
+    volumes:
+      - hive_warehouse:/opt/hive/warehouse
+    networks:
+      - bigdata_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:10000/ || exit 1"]
+      interval: 15s
+      retries: 12
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  # Optional: ngrok to expose UIs publicly if NGROK_AUTH_TOKEN is set
+  ngrok:
+    image: wernight/ngrok
+    container_name: ngrok
+    environment:
+      NGROK_AUTH_TOKEN: "${NGROK_AUTH_TOKEN}"
+    command: /bin/sh -c "while :; do sleep 3600; done"
+    networks:
+      - bigdata_net
+    volumes:
+      - ngrok_cfg:/root/.ngrok2
+    # NOTE: Start/stop tunnels via start.sh (do not hardcode tokens)
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+volumes:
+  pgdata:
+  kafkalogs:
+  hdfs_namenode:
+  hdfs_datanode:
+  hive_warehouse:
+  ngrok_cfg:
