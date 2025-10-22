@@ -1,0 +1,30 @@
+{
+  // Devcontainer that brings up docker-compose and forwards ports for UIs.
+  "name": "Big Data Workspace (Hadoop / Spark / Hive / Kafka)",
+  "dockerComposeFile": ["../docker-compose.yml"],
+  "service": "workspace",
+  "workspaceFolder": "/workspace",
+  "shutdownAction": "stopCompose",
+  "forwardPorts": [
+    9870, 8088, 8080, 8081, 9083, 10000, 9092, 2181, 9000, 9001
+  ],
+  "postCreateCommand": "/workspace/start.sh",
+  "extensions": [
+    "ms-python.python",
+    "ms-azuretools.vscode-docker",
+    "njpwerner.autodocstring",
+    "ms-vscode.cpptools",
+    "ms-toolsai.jupyter"
+  ],
+  "remoteUser": "vscode",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:1": {}
+  },
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.shell.linux": "/bin/bash"
+      }
+    }
+  }
+}
