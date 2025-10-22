@@ -1,0 +1,6 @@
+git clone <repo>
+cd <repo>
+cp .env.example .env
+# edit .env: set POSTGRES_PASSWORD and optional NGROK_AUTH_TOKEN
+docker-compose up -d
+./start.sh
